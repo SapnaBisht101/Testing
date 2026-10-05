@@ -93,3 +93,4 @@ The core logic resides in `CertificateRegistry.sol`:
 This project was developed as a Major Project to solve the problem of academic document fraud.
 
 ---
+# Testing
