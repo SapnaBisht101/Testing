@@ -16,18 +16,14 @@ import adminRoutes from "./routes/admin.js"
 import changePasswordRoute from "./routes/forgetpassword.js"
 
 const app = express();
-const PORT = 4000;
+const PORT = Number(process.env.PORT || 4000);
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/certifier";
 
 // ------------------- MIDDLEWARE -------------------
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // ------------------- DATABASE CONNECTION -------------------
-mongoose
-.connect("mongodb://127.0.0.1:27017/certifier")
-.then(() => console.log("✅ MongoDB connected successfully"))
-.catch((err) => console.error("❌ MongoDB connection error:", err));
-
 // ------------------- ROUTES -------------------
 app.use("",(req,res,next)=>{console.log("----------------------------------");next();}       );
 
@@ -42,4 +38,15 @@ app.use("/admin",adminRoutes)
 app.use("/changepassword",changePasswordRoute)
 
 // ------------------- START SERVER -------------------
-app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+const startServer = async () => {
+  try {
+    await mongoose.connect(MONGO_URI);
+    console.log("✅ MongoDB connected successfully");
+    app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err);
+    process.exitCode = 1;
+  }
+};
+
+startServer();

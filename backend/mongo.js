@@ -38,6 +38,7 @@ const AdminSchema = new mongoose.Schema({
 
 // --- CERTIFICATE SCHEMA ---
 const CertificateSchema = new mongoose.Schema({
+  templateVersion: { type: String, default: "1.0" },
   qrCodeId: { type: String, required: true, unique: true },
   studentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
   recipientName: { type: String, required: true },

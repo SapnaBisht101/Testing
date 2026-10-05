@@ -19,6 +19,24 @@ const handleDownloadPDF = async (qrCodeImage,qrCodeId,setLoading,showMessage,cer
   showMessage("Generating PDF...");
 
   try {
+    if (document.fonts?.ready) {
+      await document.fonts.ready;
+    }
+    const bounds = element.getBoundingClientRect();
+    const safeArea = element.querySelector("[data-certificate-safe-area]")?.getBoundingClientRect();
+    const qrElement = element.querySelector("[data-certificate-qr]")?.getBoundingClientRect();
+    const requiredBounds = [safeArea, qrElement].filter(Boolean);
+    const invalidBounds = requiredBounds.some(
+      (item) =>
+        item.left < bounds.left ||
+        item.right > bounds.right ||
+        item.top < bounds.top ||
+        item.bottom > bounds.bottom,
+    );
+    if (invalidBounds) {
+      throw new Error("Certificate content does not fit inside the A4 page.");
+    }
+
     // Capture high-quality render of the certificate
     const canvas = await html2canvas(element, {
       scale: 3,

@@ -25,6 +25,9 @@ import jsQR from "jsqr";
 import { useMessage } from "../GlobalMessageProvider";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min?url";
+import { CERTIFICATE_TEMPLATE, CERTIFICATE_TEMPLATE_VERSION } from "../../config/certificateTemplate.js";
+import { buildOcrResult } from "../../utils/ocrSchema.js";
+import { validateOcrField } from "../../utils/ocrNormalization.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -45,9 +48,19 @@ const STATUS_LABELS = {
   INVALID: "Invalid",
 };
 
-const TEMPLATE_OCR_REGIONS = [
-  { key: "qrCodeId", label: "Certificate ID", x: 0.17, y: 0.025, w: 0.66, h: 0.055, psm: "7" },
-];
+const TEMPLATE_OCR_REGIONS = Object.entries(CERTIFICATE_TEMPLATE.fields).map(([configuredKey, field]) => {
+  const key = configuredKey === "certificateId" ? "qrCodeId" : configuredKey;
+  return {
+  ...field,
+  key,
+  label:
+    key === "qrCodeId"
+      ? "Certificate ID"
+      : key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
+  w: field.width,
+  h: field.height,
+  };
+});
 
 const OCR_FIELD_PASSES = [
   { name: "single_line", psm: "7" },
@@ -146,6 +159,10 @@ const buildDateSearchTokens = (value) => {
 const buildExpectedOcrSegments = (qrPayload = {}) =>
   [
     { key: "qrCodeId", label: "Certificate ID", value: qrPayload.qrCodeId, type: "id" },
+    { key: "studentName", label: "Student Name", value: qrPayload.studentName, type: "text" },
+    { key: "issuerName", label: "Issuer Name", value: qrPayload.issuerName, type: "text" },
+    { key: "certificateTitle", label: "Certificate Title", value: qrPayload.certificateTitle, type: "text" },
+    { key: "completionDate", label: "Date Of Issuance", value: qrPayload.completionDate, type: "date" },
   ].filter((segment) => segment.value);
 
 const buildQrFieldLog = (qrPayload = {}) => ({
@@ -717,7 +734,7 @@ const postVerification = useCallback(
   }, []);
 
   const verifyCompleteCertificate = useCallback(
-    async ({ qrData, ocrFields, rawText }) => {
+    async ({ qrData, ocrFields, rawText, structuredResult }) => {
       const parsed = parseQrPayload(qrData);
       if (!parsed.qrCodeId) {
         setError("Certificate QR is missing or unreadable.");
@@ -725,11 +742,26 @@ const postVerification = useCallback(
         return;
       }
 
-      const ocrStep = verifyOcrLocally(qrData, ocrFields, rawText);
+      const fieldValues = Object.fromEntries(
+        Object.entries(ocrFields || {}).map(([key, field]) => [key, field?.value ?? field ?? ""]),
+      );
+      const ocrStep = verifyOcrLocally(qrData, fieldValues, rawText);
       setLoadingLabel("Running OCR and blockchain check (DB record will be shown if found)...");
       await postVerificationWithSteps(
         "/verify-certificate",
-        { qrData, rawText },
+        {
+          qrData,
+          rawText,
+          ocrFields: Object.fromEntries(
+            Object.entries(fieldValues).map(([key, value]) => [key, value || null]),
+          ),
+          ocrMetadata: {
+            schemaVersion: "1.0",
+            templateVersion: CERTIFICATE_TEMPLATE_VERSION,
+            overallConfidence: structuredResult?.confidence?.overall || 0,
+          },
+          ocrValidation: structuredResult?.validation || null,
+        },
         [ocrStep],
         "Certificate verification successful.",
       );
@@ -747,8 +779,10 @@ const postVerification = useCallback(
       },
     });
 
-    const extractedText = result.data?.text || "";
-    return extractedText;
+    return {
+      text: result.data?.text || "",
+      confidence: Number.isFinite(result.data?.confidence) ? result.data.confidence / 100 : 0,
+    };
   }, []);
 
   const runFullDocumentOcr = useCallback(
@@ -766,9 +800,10 @@ const postVerification = useCallback(
       for (const variant of variants) {
         for (const pass of OCR_DOCUMENT_PASSES) {
           setScanProgress(`OCR (${progressLabel}): full document ${variant.name} ${pass.name}`);
-          const rawText = await runImageOcr(variant.canvas, `${progressLabel} full document ${variant.name} ${pass.name}`, {
+          const ocrResult = await runImageOcr(variant.canvas, `${progressLabel} full document ${variant.name} ${pass.name}`, {
             tessedit_pageseg_mode: pass.psm,
           });
+          const rawText = ocrResult.text;
           const cleanedText = cleanOCR(rawText);
           allCandidates.push(cleanedText);
           const candidateScore =
@@ -814,11 +849,14 @@ const postVerification = useCallback(
         for (const variant of fieldVariants) {
           for (const pass of OCR_FIELD_PASSES) {
             setScanProgress(`OCR (${progressLabel}): ${region.label} ${variant.name} ${pass.name}`);
-            const rawFieldText = await runImageOcr(variant.canvas, `${progressLabel} ${region.label} ${variant.name} ${pass.name}`, {
+            const ocrResult = await runImageOcr(variant.canvas, `${progressLabel} ${region.label} ${variant.name} ${pass.name}`, {
               tessedit_pageseg_mode: pass.psm || region.psm,
             });
+            const rawFieldText = ocrResult.text;
             const cleanedFieldText = cleanOCRLine(stripCertificateIdLabel(rawFieldText));
-            const candidateScore = segment ? scoreOcrCandidate(segment, cleanedFieldText) : cleanedFieldText.length;
+            const candidateScore = segment
+              ? scoreOcrCandidate(segment, cleanedFieldText) + ocrResult.confidence
+              : ocrResult.confidence;
 
             if (candidateScore > bestScore) {
               bestScore = candidateScore;
@@ -833,11 +871,22 @@ const postVerification = useCallback(
           }
         }
 
-        fieldValues[region.key] = bestText;
+        const validation = validateOcrField(bestText, region);
+        fieldValues[region.key] = {
+          value: validation.value,
+          rawValue: bestText,
+          confidence: Math.max(0, Math.min(1, bestScore > 0 ? Math.min(1, bestScore / 100) : 0)),
+          accepted: validation.valid,
+          valid: validation.valid,
+          lineConstraintsValid: !validation.errors.includes("OCR_LINE_LIMIT_EXCEEDED"),
+          errors: validation.errors,
+          linesDetected: validation.linesDetected,
+        };
         fieldDebug[region.key] = {
           label: region.label,
           selected: bestMeta,
           value: bestText,
+          validation,
         };
       }
 
@@ -853,14 +902,26 @@ const postVerification = useCallback(
         runTemplateFieldOcr(canvas, qrPayload, progressLabel),
         runFullDocumentOcr(canvas, progressLabel, qrPayload),
       ]);
-      const rawText = buildUniqueTextBlock(fullDocumentText, ...Object.values(fieldValues));
+      const rawText = buildUniqueTextBlock(
+        fullDocumentText,
+        ...Object.values(fieldValues).map((field) => field.rawValue),
+      );
+      const ocrResult = buildOcrResult({
+        fields: fieldValues,
+        rawText,
+        templateVersion: CERTIFICATE_TEMPLATE_VERSION,
+      });
 
       console.log(`[OCR][${progressLabel}][raw_text]`, rawText || "No OCR text extracted");
       console.log(`[OCR][${progressLabel}][fields]`, fieldValues);
       console.log(`[OCR][${progressLabel}][selection]`, fieldDebug);
 
       return {
-        ocrFields: fieldValues,
+        ocrFields: {
+          ...fieldValues,
+          certificateId: fieldValues.qrCodeId,
+        },
+        structuredResult: ocrResult,
         rawText,
         fullDocumentText,
         fieldDebug,
@@ -955,10 +1016,14 @@ const postVerification = useCallback(
 
           if (!qrData) throw new Error("No QR code detected in the certificate image.");
 
-          const { ocrFields, rawText } = await extractCertificateOcr(canvas, qrData, "certificateImage");
+          const { ocrFields, rawText, structuredResult } = await extractCertificateOcr(
+            canvas,
+            qrData,
+            "certificateImage",
+          );
           URL.revokeObjectURL(objectUrl);
           setLoading(false);
-          await verifyCompleteCertificate({ qrData, ocrFields, rawText });
+          await verifyCompleteCertificate({ qrData, ocrFields, rawText, structuredResult });
         } catch (err) {
           URL.revokeObjectURL(objectUrl);
           setLoading(false);
@@ -1009,6 +1074,7 @@ const postVerification = useCallback(
         let ocrFields = null;
         let rawText = "";
         let qrData = null;
+        let structuredResult = null;
 
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
           setScanProgress(`Rendering page ${pageNum} of ${pdf.numPages}...`);
@@ -1025,6 +1091,7 @@ const postVerification = useCallback(
             const extraction = await extractCertificateOcr(canvas, qrData, `certificatePdf page ${pageNum}`);
             ocrFields = extraction.ocrFields;
             rawText = extraction.rawText;
+            structuredResult = extraction.structuredResult;
             break;
           }
         }
@@ -1038,7 +1105,7 @@ const postVerification = useCallback(
         }
 
         setLoading(false);
-        await verifyCompleteCertificate({ qrData, ocrFields, rawText });
+        await verifyCompleteCertificate({ qrData, ocrFields, rawText, structuredResult });
       } catch (err) {
         setLoading(false);
         setError(err.message || "Failed to process the PDF document.");

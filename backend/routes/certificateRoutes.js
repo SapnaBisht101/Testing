@@ -14,6 +14,7 @@
   import { Jimp } from "jimp";
 
   const router = express.Router();
+  const OCR_MATCH_THRESHOLD = 80;
 
   const generateCertificateHash = (data) => {
     const qrId = String(data.qrCodeId || "").trim();
@@ -71,6 +72,29 @@
   const toNormalizedSearchToken = (value) => normalizeTextBlock(value);
   const toCompactIdentifier = (value) => normalizeValue(value).replace(/[^a-z0-9]/g, "");
   const toWordTokens = (value) => toNormalizedSearchToken(value).split(" ").filter(Boolean);
+
+  const normalizeOcrIdentifier = (value) =>
+    toCompactIdentifier(value)
+      .replace(/o/g, "0")
+      .replace(/[il]/g, "1");
+
+  const levenshteinDistance = (left, right) => {
+    const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+
+    for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+      const current = [leftIndex];
+      for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+        current[rightIndex] = Math.min(
+          current[rightIndex - 1] + 1,
+          previous[rightIndex] + 1,
+          previous[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
+        );
+      }
+      previous.splice(0, previous.length, ...current);
+    }
+
+    return previous[right.length];
+  };
 
   const buildDateSearchTokens = (value) => {
     const normalizedRawValue = toNormalizedSearchToken(value);
@@ -212,7 +236,37 @@
     institutionName: cert.institutionName,
     completionDate: cert.completionDate,
     certificateTitle: cert.certificateTitle,
+    templateVersion: cert.templateVersion || "1.0",
   });
+
+  const validateStructuredOcr = (ocrFields, ocrMetadata = {}, ocrValidation = {}) => {
+    const fields = ocrFields && typeof ocrFields === "object" ? ocrFields : {};
+    const required = ["certificateId", "certificateTitle", "studentName", "issuerName", "completionDate"];
+    const errors = [];
+
+    if (ocrMetadata.schemaVersion && ocrMetadata.schemaVersion !== "1.0") {
+      errors.push({ code: "OCR_SCHEMA_UNSUPPORTED", field: null });
+    }
+    if (ocrMetadata.templateVersion && ocrMetadata.templateVersion !== "1.0") {
+      errors.push({ code: "TEMPLATE_VERSION_UNSUPPORTED", field: null });
+    }
+    if (ocrMetadata.overallConfidence != null) {
+      const confidence = Number(ocrMetadata.overallConfidence);
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        errors.push({ code: "OCR_INVALID_CONFIDENCE", field: null });
+      }
+    }
+    if (ocrValidation.lineConstraintsValid === false) {
+      errors.push({ code: "OCR_LINE_LIMIT_EXCEEDED", field: null });
+    }
+    required.forEach((field) => {
+      if (typeof fields[field] !== "string" || !fields[field].trim()) {
+        errors.push({ code: "OCR_FIELD_NOT_FOUND", field });
+      }
+    });
+
+    return { valid: errors.length === 0, errors };
+  };
 
   const serializeCertificate = (cert) => {
     const plain = cert.toObject ? cert.toObject() : cert;
@@ -281,7 +335,25 @@
   };
 
   const verifyAgainstBlockchain = async (cert) => {
-    const onChainData = await contract.getCertificate(cert.qrCodeId.trim());
+    let onChainData;
+    try {
+      onChainData = await contract.getCertificate(cert.qrCodeId.trim());
+    } catch (error) {
+      console.error(`[VERIFY][BLOCKCHAIN] Lookup failed for ${cert.qrCodeId}:`, error);
+      return formatStep(
+        "blockchain_verified",
+        false,
+        {
+          blockchainHash: null,
+          databaseHash: cert.certificateHash || null,
+          transactionHash: cert.txHash || null,
+          errorCode: error.code || "BLOCKCHAIN_LOOKUP_FAILED",
+          error: error.shortMessage || error.message,
+        },
+        "Blockchain record could not be read. Check that the local RPC node and deployed contract are running.",
+      );
+    }
+
     const blockchainHash = onChainData?.certificateHash || "";
 
     if (!blockchainHash) {
@@ -331,12 +403,20 @@
     const missingSegments = segmentResults
       .filter((segment) => !segment.match.matched)
       .map((segment) => segment.label);
-    const passed = missingSegments.length === 0;
+    const matchedSegments = segmentResults.filter((segment) => segment.match.matched).length;
+    const matchPercentage = expectedSegments.length
+      ? (matchedSegments / expectedSegments.length) * 100
+      : 0;
+    const passed = matchPercentage >= OCR_MATCH_THRESHOLD;
 
     return formatStep(
       "ocr_verified",
       passed,
       {
+        matchPercentage,
+        matchThreshold: OCR_MATCH_THRESHOLD,
+        matchedSegments,
+        totalSegments: expectedSegments.length,
         expectedSegments: segmentResults.map(({ key, label, value, type, match }) => ({
           key,
           label,
@@ -349,8 +429,91 @@
         ignoredVisualElements: ["signatureImage", "institutionLogo"],
       },
       passed
-        ? "All required certificate fields were matched between QR and OCR."
-        : "One or more required certificate fields could not be matched in OCR."
+        ? `OCR matches ${matchPercentage.toFixed(0)}% of the QR certificate data.`
+        : `OCR matches only ${matchPercentage.toFixed(0)}% of the QR certificate data; 80% is required.`
+    );
+  };
+
+  const verifyStructuredOcrVsQr = (
+    ocrFields = {},
+    qrPayload = {},
+    schemaValidation,
+    rawText = "",
+  ) => {
+    const comparisons = [
+      ["certificateId", "qrCodeId", "Certificate ID"],
+      ["studentName", "studentName", "Student Name"],
+      ["issuerName", "issuerName", "Issuer Name"],
+      ["certificateTitle", "certificateTitle", "Certificate Title"],
+      ["completionDate", "completionDate", "Date Of Issuance"],
+    ];
+    const comparisonResults = comparisons.map(([ocrKey, qrKey, label]) => {
+        const actual = normalizeValue(ocrFields[ocrKey]);
+        const expected = normalizeValue(qrPayload[qrKey]);
+        if (!actual || !expected) return { ocrKey, qrKey, label, matched: false };
+
+        if (ocrKey === "certificateId") {
+          const expectedId = normalizeOcrIdentifier(expected);
+          const actualId = normalizeOcrIdentifier(actual);
+          const rawId = normalizeOcrIdentifier(rawText);
+          const directMatch = actualId.includes(expectedId) || rawId.includes(expectedId);
+          const fuzzyMatch =
+            Math.abs(expectedId.length - actualId.length) <= 2 &&
+            levenshteinDistance(expectedId, actualId) <= 2;
+          return { ocrKey, qrKey, label, matched: directMatch || fuzzyMatch };
+        }
+
+        if (ocrKey === "completionDate" && actual && expected) {
+          const actualDate = new Date(actual);
+          const expectedDate = new Date(expected);
+          return {
+            ocrKey,
+            qrKey,
+            label,
+            matched:
+              !Number.isNaN(actualDate.getTime()) &&
+              !Number.isNaN(expectedDate.getTime()) &&
+              actualDate.toISOString().slice(0, 10) === expectedDate.toISOString().slice(0, 10),
+          };
+        }
+        if (actual === expected) return { ocrKey, qrKey, label, matched: true };
+
+        const expectedTokens = toWordTokens(expected).filter((token) => token.length > 1);
+        const actualTokens = new Set(toWordTokens(actual));
+        const matchedTokens = expectedTokens.filter((token) => actualTokens.has(token));
+        return {
+          ocrKey,
+          qrKey,
+          label,
+          matched: expectedTokens.length > 0 && matchedTokens.length / expectedTokens.length >= 0.6,
+        };
+      });
+    const matchedFields = comparisonResults.filter((comparison) => comparison.matched).length;
+    const matchPercentage = comparisons.length ? (matchedFields / comparisons.length) * 100 : 0;
+    const mismatches = comparisonResults
+      .filter((comparison) => !comparison.matched)
+      .map((comparison) => comparison.label);
+    const errors = schemaValidation?.errors || [];
+    const passed = matchPercentage >= OCR_MATCH_THRESHOLD && errors.length === 0;
+
+    return formatStep(
+      "ocr_verified",
+      passed,
+      {
+        structured: true,
+        matchPercentage,
+        matchThreshold: OCR_MATCH_THRESHOLD,
+        matchedFields,
+        totalFields: comparisons.length,
+        mismatches,
+        schemaErrors: errors,
+        expectedPayload: qrPayload,
+        ocrFields,
+        rawOcrText: cleanOCR(rawText),
+      },
+      passed
+        ? `Structured OCR matches ${matchPercentage.toFixed(0)}% of the QR payload.`
+        : `Structured OCR matches only ${matchPercentage.toFixed(0)}% of the QR payload; 80% is required.`,
     );
   };
 
@@ -426,6 +589,7 @@
         institutionName,
         certificateTitle,
         certificateDescription,
+        templateVersion = "1.0",
       } = req.body;
 
       const removeRequest = req.body.remove_request;
@@ -458,6 +622,7 @@
         institutionName: institutionName || issuer.institutionName,
         completionDate: normalizedCompletionDate.toISOString(),
         certificateTitle,
+        templateVersion,
       };
       const qrCodeUrl = await QRCode.toDataURL(JSON.stringify(payload));
 
@@ -471,6 +636,7 @@
         certificateTitle,
         courseName,
         certificateDescription,
+        templateVersion,
         qrImage: qrCodeUrl,
         completionDate: normalizedCompletionDate,
         certificateHash,
@@ -570,7 +736,7 @@
 
   router.post("/verify-certificate", async (req, res) => {
     try {
-      const { qrData, rawText } = req.body;
+      const { qrData, rawText, ocrFields, ocrMetadata, ocrValidation } = req.body;
       const parsed = parseQrPayload(qrData);
       console.log("[VERIFY][CERTIFICATE][OCR_RAW_TEXT]", cleanOCR(rawText || ""));
 
@@ -586,7 +752,18 @@
         return res.status(404).json({ valid: false, message: "Certificate not found in registry." });
       }
 
-      const ocrStep = verifyOcrVsQr(rawText, parsed.payload);
+      const structuredValidation = ocrFields
+        ? validateStructuredOcr(ocrFields, ocrMetadata, ocrValidation)
+        : null;
+      const ocrStep = ocrFields && structuredValidation
+        ? verifyStructuredOcrVsQr(ocrFields, parsed.payload, structuredValidation, rawText)
+        : verifyOcrVsQr(rawText, parsed.payload);
+      if (!ocrStep.passed) {
+        return sendVerificationResponse(res, {
+          steps: [ocrStep],
+          fallbackStatus: "CERTIFICATE_INVALID_OCR_MISMATCH",
+        });
+      }
       const dbStep = verifyAgainstDatabase(cert, parsed.payload);
       const blockchainStep = await verifyAgainstBlockchain(cert);
 

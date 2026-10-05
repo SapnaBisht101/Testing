@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from "react";
+import React, { useState, useCallback, useMemo } from "react";
 import { useMessage } from "../GlobalMessageProvider.jsx";
 import axios from "axios";
 import { fetchUserDetails } from "../../js/fetch.js";
@@ -6,6 +6,8 @@ import { useLocation, useNavigate } from "react-router";
 import Tempelate from "../../components/Tempelate.jsx";
 import handleDownloadPDF from "../../components/Downloadpdf.js";
 import { ArrowLeft } from "lucide-react";
+import { CERTIFICATE_TEMPLATE_VERSION } from "../../config/certificateTemplate.js";
+import { calculateCertificateLayout } from "../../utils/textFitting.js";
 // Utility: Converts File object to Base64 string
 const fileToBase64 = (file) =>
   new Promise((res, rej) => {
@@ -14,6 +16,31 @@ const fileToBase64 = (file) =>
     reader.onload = () => res(reader.result);
     reader.onerror = (e) => rej(e);
   });
+
+const FIELD_LIMITS = {
+  certificateTitle: { maxCharacters: 100, maxLines: 2 },
+  name: { maxCharacters: 80, maxLines: 2 },
+  issuerName: { maxCharacters: 100, maxLines: 2 },
+  institutionName: { maxCharacters: 120, maxLines: 2 },
+  courseName: { maxCharacters: 100, maxLines: 2 },
+  certificateDescription: { maxCharacters: 180, maxLines: 4 },
+};
+
+const validateCertificateText = (data) => {
+  const errors = [];
+  Object.entries(FIELD_LIMITS).forEach(([field, limits]) => {
+    const value = String(data[field] || "").trim();
+    const lineCount = value ? Math.ceil(value.length / Math.max(1, Math.floor(limits.maxCharacters / limits.maxLines))) : 0;
+    if (!value) errors.push(`${field} is required.`);
+    if (value.length > limits.maxCharacters) {
+      errors.push(`${field} is too long (maximum ${limits.maxCharacters} characters).`);
+    }
+    if (lineCount > limits.maxLines) {
+      errors.push(`${field} must fit within ${limits.maxLines} lines.`);
+    }
+  });
+  return errors;
+};
 
 // Custom Hook for Drag and Drop
 const useDragAndDrop = (onDrop) => {
@@ -91,6 +118,7 @@ const CertificateGenerator = () => {
   const [qrCodeId, setQrCodeId] = useState(null);
 
   const [loading, setLoading] = useState(false);
+  const layout = useMemo(() => calculateCertificateLayout(certData), [certData]);
 
   // --- Data Fetching Logic ---
   const fetchStudentDetails = async () => {
@@ -157,6 +185,16 @@ const CertificateGenerator = () => {
         "error",
       );
 
+    const validationErrors = validateCertificateText(certData);
+    if (validationErrors.length > 0) {
+      showMessage(validationErrors[0], "error");
+      return;
+    }
+    if (!layout.valid) {
+      showMessage("Certificate text does not fit the fixed certificate layout.", "error");
+      return;
+    }
+
     setLoading(true);
     showMessage("Generating QR code and saving data...");
 
@@ -170,6 +208,7 @@ const CertificateGenerator = () => {
         institutionName: certData.institutionName,
         certificateTitle: certData.certificateTitle,
         certificateDescription: certData.certificateDescription,
+        templateVersion: CERTIFICATE_TEMPLATE_VERSION,
         remove_request: remove_request,
       };
 
@@ -379,6 +418,7 @@ const CertificateGenerator = () => {
               certData={certData}
               qrCodeImage={qrCodeImage}
               qrCodeId={qrCodeId}
+              layout={layout}
             />
           </div>
         </div>

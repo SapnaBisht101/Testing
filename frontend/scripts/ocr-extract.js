@@ -69,12 +69,12 @@ const preprocessImage = async (inputPath) => {
 const runOcr = async (imagePath) => {
   try {
     const {
-      data: { text },
+      data: { text, confidence },
     } = await Tesseract.recognize(imagePath, "eng", {
       tessedit_pageseg_mode: 3, // fully automatic page segmentation
       preserve_interword_spaces: "1",
     });
-    return text || "";
+    return { text: text || "", confidence: Number(confidence || 0) / 100 };
   } catch (err) {
     throw new Error(`OCR failed: ${err.message}`);
   }
@@ -210,8 +210,11 @@ export const extractFromImage = async (inputPath = DEFAULT_IMAGE) => {
 
   const { dir, file } = await preprocessImage(inputPath);
   let text = "";
+  let confidence = 0;
   try {
-    text = await runOcr(file);
+    const ocr = await runOcr(file);
+    text = ocr.text;
+    confidence = ocr.confidence;
   } finally {
     await cleanupTempDir(dir);
   }
@@ -224,12 +227,37 @@ export const extractFromImage = async (inputPath = DEFAULT_IMAGE) => {
   console.log("--- EXTRACTED JSON ---");
   console.log(formatForLogging(extracted));
 
+  const allRequiredFieldsPresent = Boolean(
+    extracted.certificateId &&
+      extracted.certificateTitle &&
+      extracted.dateOfIssuance &&
+      extracted.studentName &&
+      extracted.issuerName,
+  );
   const output = {
+    schemaVersion: "1.0",
+    templateVersion: "1.0",
+    success: allRequiredFieldsPresent,
     certificateId: extracted.certificateId,
     certificateTitle: extracted.certificateTitle ? extracted.certificateTitle.toLowerCase() : null,
-    dateOfIssuance: extracted.dateOfIssuance ? String(extracted.dateOfIssuance).toLowerCase() : null,
     studentName: extracted.studentName ? extracted.studentName.toLowerCase() : null,
     issuerName: extracted.issuerName ? extracted.issuerName.toLowerCase() : null,
+    completionDate: extracted.dateOfIssuance ? String(extracted.dateOfIssuance).toLowerCase() : null,
+    confidence: {
+      certificateId: extracted.certificateId ? confidence : 0,
+      certificateTitle: extracted.certificateTitle ? confidence : 0,
+      studentName: extracted.studentName ? confidence : 0,
+      issuerName: extracted.issuerName ? confidence : 0,
+      completionDate: extracted.dateOfIssuance ? confidence : 0,
+      overall: confidence,
+    },
+    validation: {
+      valid: allRequiredFieldsPresent,
+      schemaValid: true,
+      allRequiredFieldsPresent,
+      lineConstraintsValid: true,
+      ocrMatchesQr: false,
+    },
   };
 
   await fs.writeFile("result.json", JSON.stringify(output, null, 2), "utf8");
